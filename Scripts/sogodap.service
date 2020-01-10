@@ -1,0 +1,18 @@
+[Unit]
+Description=SOGodap LDAP Server
+ConditionPathExists=/usr/local/bin/SOGodap
+After=network.target
+
+[Service]
+Type=simple
+User=sogo
+Group=sogo
+
+Restart=on-failure
+RestartSec=10
+startLimitIntervalSec=60
+
+ExecStart=/usr/local/bin/SOGodap -syslog
+
+[Install]
+WantedBy=multi-user.target
