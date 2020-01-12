@@ -1,5 +1,5 @@
 /*
-Copyright 2015 Sigma Consulting Services Limited
+Copyright 2015-20 Sigma Consulting Services Limited
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -38,6 +38,7 @@ import (
 
 var conf map[string]interface{}
 var db *sql.DB
+var dbCombined bool
 var debugMode bool
 var dsnInfo string
 var maxEntries int
@@ -93,7 +94,7 @@ func main() {
 	}
 
 	// output version information
-	log.Print("SOGodap v1.0.0 © 2015 Sigma Consulting Services")
+	log.Print("SOGodap v1.1.0 © 2015-20 Sigma Consulting Services")
 	debugMode = *debugPtr
 
 	// read SOGodap configuration file
@@ -128,8 +129,9 @@ func main() {
 	        log.Fatal(err)
 	}
 
-	// extract SOGo database connection string
+	// extract SOGo database connection string and check table layout
 	dsnInfo = getDSN(configString(sogo, "OCSFolderInfoURL"))
+	dbCombined = (configString(sogo, "OCSStoreURL") != "")
 
 	// create a database handle
 	debug("Connecting to database")
@@ -210,7 +212,9 @@ func debug(format string, args ...interface{}) {
 
 func findContacts(db *sql.DB, table string, constraint string, attribs []string) Contacts {
 	var people Contacts
-	contact, err := db.Query("select c_content from " + table + " where c_deleted is null and " + constraint)
+	query := "select c_content from " + table + " where c_deleted is null" + constraint
+	debug("Query for matching contacts: %#v", query)
+	contact, err := db.Query(query)
 	if err != nil {
 		debug("Address book search failed: %s", err.Error())
 		return people
@@ -321,7 +325,7 @@ func parseContact(card vcard.Card, attrs []string) (Contact, bool) {
 	return person, valid
 }
 
-func sqlConstraint(req ldap.SearchRequest) string {
+func sqlConstraint(req ldap.SearchRequest, id string) string {
 	var sql string
 
 	conjunction := ""
@@ -333,22 +337,27 @@ func sqlConstraint(req ldap.SearchRequest) string {
 		case "|":
 			conjunction = " or "
 		default:
-			if !strings.Contains(element, "=") { break }
+			if !strings.Contains(element, "=") { continue }
 			query := strings.TrimRight(element, ")")
 			query = strings.TrimSpace(query)
 			query = sqlRegex(query)
 			if (query != "") {
-				if (len(sql) > 0) && (conjunction != "") {
-					sql += conjunction
-				}
+				if (len(sql) > 0) && (conjunction != "") { sql += conjunction }
 				sql += "c_content regexp '" + query + "'"
 			}
 		}
 	}
 
-	if req.SizeLimit > 0 {
-		sql += " limit " + strconv.Itoa(req.SizeLimit)
+	if id != "" {
+		if len(sql) > 0 {
+			sql = "c_folder_id = " + id + " and (" + sql + ")"
+		} else {
+			sql = "c_folder_id = " + id
+		}
 	}
+
+	if len(sql) > 0 { sql = " and " + sql }
+	if req.SizeLimit > 0 { sql += " limit " + strconv.Itoa(req.SizeLimit) }
 
 	return sql
 }
@@ -429,10 +438,15 @@ func (h ldapHandler) Search(boundDN string, searchReq ldap.SearchRequest, conn n
 	debug("Limiting results to %d entries", searchReq.SizeLimit)
 
 	// locate address books to search
+	var query string
 	debug("Searching table %s for address books of %s", infoTable, users)
 	debug("Returning attributes: %s", searchReq.Attributes)
-	abQuery := "select c_location from " + infoTable + " where c_folder_type = 'Contact' and c_path2 in " + sqlInClause(users)
-	addrBook, err := db.Query(abQuery)
+	if dbCombined {
+		query = "select c_folder_id from " + infoTable + " where c_folder_type = 'Contact' and c_path2 in " + sqlInClause(users)
+	} else {
+		query = "select c_location from " + infoTable + " where c_folder_type = 'Contact' and c_path2 in " + sqlInClause(users)
+	}
+	addrBook, err := db.Query(query)
 	if err != nil {
 		debug("Address book table lookup failed: %s", err.Error)
 		return ldap.ServerSearchResult{[]*ldap.Entry{}, []string{}, []ldap.Control{}, ldap.LDAPResultOperationsError}, nil
@@ -440,20 +454,32 @@ func (h ldapHandler) Search(boundDN string, searchReq ldap.SearchRequest, conn n
 	defer addrBook.Close()
 
 	// loop through returned address books
-	var abURL string
+	var abID string
 	var people Contacts
 	for addrBook.Next() {
-		err := addrBook.Scan(&abURL)
+		err := addrBook.Scan(&abID)
 		if err != nil {
 			debug("Failed reading address book info: %s", err.Error())
 			continue
 		}
 
+		var abDSN string
+		var abTable string
+		var abConstraint string
+
+		if dbCombined {
+			abDSN = getDSN(configString(sogo, "OCSStoreURL"))
+			abTable = getTable(configString(sogo, "OCSStoreURL"))
+			abConstraint = sqlConstraint(searchReq, abID)
+		} else {
+			abDSN = getDSN(abID)
+			abTable = getTable(abID)
+			abConstraint = sqlConstraint(searchReq, "")
+		}
+
 		// check if new DB handle is needed (pool if not)
-		abDSN := getDSN(abURL)
-		abTable := getTable(abURL)
 		if abDSN == dsnInfo {
-			people = append(people, findContacts(db, abTable, sqlConstraint(searchReq), searchReq.Attributes)...)
+			people = append(people, findContacts(db, abTable, abConstraint, searchReq.Attributes)...)
 		} else {
 			// create a database handle
 			debug("Connecting to database for address book search")
@@ -471,7 +497,7 @@ func (h ldapHandler) Search(boundDN string, searchReq ldap.SearchRequest, conn n
 				continue
 			}
 
-			people = append(people, findContacts(abDB, abTable, sqlConstraint(searchReq), searchReq.Attributes)...)
+			people = append(people, findContacts(abDB, abTable, abConstraint, searchReq.Attributes)...)
 			abDB.Close()
 		}
 	}
